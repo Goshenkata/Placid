@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Placid",
+  "version": "0.1.0",
+  "description": "Context filtering with AI",
+  "background": {
+    "service_worker": "dist/background.js",
+    "scripts": ["dist/background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["dist/content.js"]
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "placid@tusofia",
+      "strict_min_version": "121.0"
+    }
+  }
+}
