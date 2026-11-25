@@ -1,8 +1,8 @@
 import { PreTrainedModel, PreTrainedTokenizer, Tensor } from "@huggingface/transformers";
-import type { ModelSession } from "../modelTypes";
+import type { DecisionSession } from "../modelTypes";
 
 /** A loaded d1-omni-600M that answers yes/no questions about texts. Get one from D1OmniModel.load(). */
-export class D1OmniSession implements ModelSession {
+export class D1OmniSession implements DecisionSession {
     /** Section markers d1 was trained on: <bos> <state> text <q> question <opt> <mask> option </opt> … <decide> */
     private static readonly TOKENS = {
         state: "<|reserved_7|>", // starts the text being judged ("state" in d1's terms)
