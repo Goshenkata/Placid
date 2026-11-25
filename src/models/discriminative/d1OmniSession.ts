@@ -1,8 +1,8 @@
 import { PreTrainedModel, PreTrainedTokenizer, Tensor } from "@huggingface/transformers";
-import type { DecisionSession } from "../modelTypes";
+import type { ProbabilitySession } from "../modelTypes";
 
 /** A loaded d1-omni-600M that answers yes/no questions about texts. Get one from D1OmniModel.load(). */
-export class D1OmniSession implements DecisionSession {
+export class D1OmniSession implements ProbabilitySession {
     /** Section markers d1 was trained on: <bos> <state> text <q> question <opt> <mask> option </opt> … <decide> */
     private static readonly TOKENS = {
         state: "<|reserved_7|>", // starts the text being judged ("state" in d1's terms)
@@ -15,6 +15,9 @@ export class D1OmniSession implements DecisionSession {
 
     /** d1's question types: choice = 0, score = 1, yes/no ("noul") = 2. */
     private static readonly YES_NO_QUESTION_TYPE = 2;
+
+    /** A yes/no question is read as two options, "false" first (prompt.py's default wording). */
+    private static readonly OPTIONS = ["false: no, the statement does not hold", "true: yes, the statement holds"];
 
     /** prompt.py's token limits, worked out for a yes/no question (2 options). */
     private static readonly QUESTION_MAX_TOKENS = 96;
@@ -32,17 +35,9 @@ export class D1OmniSession implements DecisionSession {
         this.temperature = temperature;
     }
 
-    /**
-     * P(yes) for `question` about `text`, between 0 and 1.
-     * `criteria` optionally describes what "yes" and "no" mean; d1 has generic defaults.
-     */
-    async probability(text: string, question: string, criteria?: { true?: string; false?: string }): Promise<number> {
-        // A yes/no question is read as two options, "false" first (prompt.py render_options).
-        const options = [
-            "false: " + (criteria?.false || "no, the statement does not hold"),
-            "true: " + (criteria?.true || "yes, the statement holds"),
-        ];
-        const { ids, markers } = this.encode(text, question, options);
+    /** P(yes) for `question` about `text`, between 0 and 1. */
+    async probability(text: string, question: string): Promise<number> {
+        const { ids, markers } = this.encode(text, question);
         const int64 = D1OmniSession.int64Tensor;
 
         const { logits } = await this.model({
@@ -62,7 +57,7 @@ export class D1OmniSession implements DecisionSession {
     }
 
     /** Port of d1's prompt.py `encode()` for one yes/no question. */
-    private encode(text: string, questionText: string, options: string[]) {
+    private encode(text: string, questionText: string) {
         const TOKENS = D1OmniSession.TOKENS;
         const tokenId = (token: string) => this.tokenizer.convert_tokens_to_ids(token);
         const tokenize = (s: string) => this.tokenize(s);
@@ -70,7 +65,7 @@ export class D1OmniSession implements DecisionSession {
         //   <q> question <opt> <mask> false: … </opt> <opt> <mask> true: … </opt> <decide>
         const question = [tokenId(TOKENS.question), ...tokenize(questionText)].slice(0, D1OmniSession.QUESTION_MAX_TOKENS);
         const markerOffsets: number[] = []; // where each <mask> sits inside `question`
-        for (const option of options) {
+        for (const option of D1OmniSession.OPTIONS) {
             question.push(tokenId(TOKENS.option));
             markerOffsets.push(question.length);
             question.push(tokenId(TOKENS.marker), ...tokenize(" " + option).slice(0, D1OmniSession.OPTION_MAX_TOKENS), tokenId(TOKENS.optionEnd));

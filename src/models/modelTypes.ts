@@ -16,7 +16,7 @@ export type Model<Session> = {
     load(onProgress?: ProgressCallback): Promise<Session>;   // downloads first if needed; concurrent calls share one load
 };
 
-/** A loaded yes/no decision model. One session answers any number of questions. */
-export type DecisionSession = {
+/** A loaded model that gives P(yes) for a yes/no question about a text. One session answers any number of questions. */
+export type ProbabilitySession = {
     probability(text: string, question: string): Promise<number>; // P(yes) for the question about the text, 0 to 1
 };
