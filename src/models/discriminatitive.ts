@@ -62,7 +62,7 @@ export class D1OmniModel implements FilteringModel {
         this.criteria = options.criteria ?? {};
         this.threshold = options.threshold ?? 0.5;
         this.device = options.device ?? "webgpu";
-        this.dtype = options.dtype ?? "q8";
+        this.dtype = options.dtype ?? "q4";
     }
 
     get state(): ModelState {
