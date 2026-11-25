@@ -12,6 +12,14 @@ import {
 } from "@huggingface/transformers";
 import type { FilteringModel, ModelState, ProgressCallback } from "./modelTypes";
 
+/** Everything D1OmniModel.probability() needs, available once the model is loaded. */
+type D1Inference = {
+    model: PreTrainedModel;
+    tokenizer: PreTrainedTokenizer;
+    maxLength: number; // longest request the model accepts, in tokens
+    temperature: number; // calibration: divides the scores before they become a probability
+};
+
 /** LiquidAI d1-omni-600M, a yes/no decision encoder. Reference code: https://huggingface.co/LiquidAI/d1-omni-600M */
 export class D1OmniModel implements FilteringModel {
     private static readonly REPO = "onnx-community/d1-omni-600M-ONNX";
@@ -36,14 +44,8 @@ export class D1OmniModel implements FilteringModel {
     private _state: ModelState = "unknown";
     /** d1's config.json from its Hugging Face repo (not Placid's settings). */
     private modelRepoConfig: PretrainedConfig | null = null;
-    /** Everything probability() needs; null until load() finishes. */
-    private inference: {
-        model: PreTrainedModel;
-        tokenizer: PreTrainedTokenizer;
-        maxLength: number; // longest request the model accepts, in tokens
-        temperature: number; // calibration: divides the scores before they become a probability
-    } | null = null;
-    private downloadOrLoadInProgress: Promise<void> | null = null;
+    private inference: D1Inference | null = null; // set once load() finishes
+    private sharedLoad: Promise<D1Inference> | null = null; // started by the first load(); later calls wait for it
 
     private readonly question: string;
     private readonly options: [no: string, yes: string];
@@ -88,29 +90,17 @@ export class D1OmniModel implements FilteringModel {
         return this._state;
     }
 
-    /** Downloads the model files without keeping the model in memory. */
-    async download(onProgress?: ProgressCallback): Promise<void> {
-        // Let a download or load that is already running finish first.
-        while (this.downloadOrLoadInProgress) await this.downloadOrLoadInProgress.catch(() => {});
-        if (this._state === "downloaded" || this._state === "ready") return;
-
-        await this.runDownloadOrLoad(async () => {
-            const { model } = await this.downloadAndLoad(onProgress); // transformers.js can't download without loading
-            await model.dispose();
-            this._state = "downloaded";
-        });
-    }
-
     /** Downloads the model files if needed and loads the model into memory, after which request() works. */
     async load(onProgress?: ProgressCallback): Promise<void> {
-        // Let a download or load that is already running finish first.
-        while (this.downloadOrLoadInProgress) await this.downloadOrLoadInProgress.catch(() => {});
-        if (this._state === "ready") return;
-
-        await this.runDownloadOrLoad(async () => {
-            this.inference = await this.downloadAndLoad(onProgress);
+        this.sharedLoad ??= this.downloadAndLoad(onProgress);
+        try {
+            this.inference = await this.sharedLoad;
             this._state = "ready";
-        });
+        } catch (error) {
+            this.sharedLoad = null; // so the next load() starts over
+            this._state = "error";
+            throw error;
+        }
     }
 
     /** True when every file the model needs is already in the browser's download cache. */
@@ -123,21 +113,8 @@ export class D1OmniModel implements FilteringModel {
         return files.every((f) => f.cached || f.file === "preprocessor_config.json");
     }
 
-    /** Runs a download or load, remembering it as in progress; if it fails the state becomes "error". */
-    private async runDownloadOrLoad(work: () => Promise<void>): Promise<void> {
-        this.downloadOrLoadInProgress = work();
-        try {
-            await this.downloadOrLoadInProgress;
-        } catch (e) {
-            this._state = "error";
-            throw e;
-        } finally {
-            this.downloadOrLoadInProgress = null;
-        }
-    }
-
     /** Downloads any missing model files, then loads the model into memory. */
-    private async downloadAndLoad(onProgress?: ProgressCallback): Promise<NonNullable<D1OmniModel["inference"]>> {
+    private async downloadAndLoad(onProgress?: ProgressCallback): Promise<D1Inference> {
         this._state = "loading";
         const modelRepoConfig = await this.getModelRepoConfig();
         const tokenizer = await AutoTokenizer.from_pretrained(D1OmniModel.REPO);
@@ -239,6 +216,9 @@ export class D1OmniModel implements FilteringModel {
     }
 }
 
+/** Everything KevModel.probability() needs, available once the model is loaded. */
+type KevInference = { model: PreTrainedModel; tokenizer: PreTrainedTokenizer };
+
 /** Jared Palmer's Kev: Qwen3 + a pointer head that scores each option. https://huggingface.co/onnx-community/kev-4b-ONNX */
 export class KevModel implements FilteringModel {
     private static readonly REPOS = {
@@ -259,9 +239,8 @@ export class KevModel implements FilteringModel {
     private static readonly MAX_TEXT_TOKENS = 8192; // page text is cut to this (model card default)
 
     private _state: ModelState = "unknown";
-    /** Everything probability() needs; null until load() finishes. */
-    private inference: { model: PreTrainedModel; tokenizer: PreTrainedTokenizer } | null = null;
-    private downloadOrLoadInProgress: Promise<void> | null = null;
+    private inference: KevInference | null = null; // set once load() finishes
+    private sharedLoad: Promise<KevInference> | null = null; // started by the first load(); later calls wait for it
 
     private readonly repo: string;
     private readonly question: string;
@@ -302,29 +281,17 @@ export class KevModel implements FilteringModel {
         return this._state;
     }
 
-    /** Downloads the model files without keeping the model in memory. */
-    async download(onProgress?: ProgressCallback): Promise<void> {
-        // Let a download or load that is already running finish first.
-        while (this.downloadOrLoadInProgress) await this.downloadOrLoadInProgress.catch(() => {});
-        if (this._state === "downloaded" || this._state === "ready") return;
-
-        await this.runDownloadOrLoad(async () => {
-            const { model } = await this.downloadAndLoad(onProgress); // transformers.js can't download without loading
-            await model.dispose();
-            this._state = "downloaded";
-        });
-    }
-
     /** Downloads the model files if needed and loads the model into memory, after which request() works. */
     async load(onProgress?: ProgressCallback): Promise<void> {
-        // Let a download or load that is already running finish first.
-        while (this.downloadOrLoadInProgress) await this.downloadOrLoadInProgress.catch(() => {});
-        if (this._state === "ready") return;
-
-        await this.runDownloadOrLoad(async () => {
-            this.inference = await this.downloadAndLoad(onProgress);
+        this.sharedLoad ??= this.downloadAndLoad(onProgress);
+        try {
+            this.inference = await this.sharedLoad;
             this._state = "ready";
-        });
+        } catch (error) {
+            this.sharedLoad = null; // so the next load() starts over
+            this._state = "error";
+            throw error;
+        }
     }
 
     /** True when every file the model needs is already in the browser's download cache. */
@@ -333,21 +300,8 @@ export class KevModel implements FilteringModel {
         return files.every((f) => f.cached);
     }
 
-    /** Runs a download or load, remembering it as in progress; if it fails the state becomes "error". */
-    private async runDownloadOrLoad(work: () => Promise<void>): Promise<void> {
-        this.downloadOrLoadInProgress = work();
-        try {
-            await this.downloadOrLoadInProgress;
-        } catch (e) {
-            this._state = "error";
-            throw e;
-        } finally {
-            this.downloadOrLoadInProgress = null;
-        }
-    }
-
     /** Downloads any missing model files, then loads the model into memory. */
-    private async downloadAndLoad(onProgress?: ProgressCallback): Promise<NonNullable<KevModel["inference"]>> {
+    private async downloadAndLoad(onProgress?: ProgressCallback): Promise<KevInference> {
         this._state = "loading";
         const tokenizer = await AutoTokenizer.from_pretrained(this.repo);
         const model = await PreTrainedModel.from_pretrained(this.repo, {

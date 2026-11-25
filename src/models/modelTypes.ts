@@ -12,7 +12,6 @@ export type ProgressCallback = (percent: number) => void;
 export type FilteringModel = {
     readonly state: ModelState;
     checkState(): Promise<ModelState>;                  // asks the cache, fixes "unknown"
-    download(onProgress?: ProgressCallback): Promise<void>; // no-op if already downloaded
-    load(onProgress?: ProgressCallback): Promise<void>;     // downloads first if needed
+    load(onProgress?: ProgressCallback): Promise<void>; // downloads first if needed; calls during a load share it
     request(input: string): Promise<boolean>;           // only works when "ready"
 }
