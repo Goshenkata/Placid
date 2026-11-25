@@ -51,7 +51,11 @@ export class D1OmniModel implements FilteringModel {
         threshold?: number;
         /** "webgpu" in the browser; "cpu" when testing in Node. */
         device?: DeviceType;
-        /** "q8" = model_quantized.onnx (0.41 GB), "q4" = model_q4.onnx (0.24 GB, less accurate). */
+        /**
+         * Which published quantization to load:
+         * "q8" = model_quantized.onnx (0.41 GB), "q4" = model_q4.onnx (0.24 GB).
+         * Same accuracy on JevBench (73.5% vs 74.1%); q4 is smaller and slightly faster.
+         */
         dtype?: Extract<DataType, "q8" | "q4">;
     }) {
         this.question = options.question;
