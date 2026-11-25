@@ -10,68 +10,26 @@ import {
     type DeviceType,
     type ProgressInfo,
 } from "@huggingface/transformers";
-import type { FilteringModel, ModelState, ProgressCallback } from "./modelTypes";
+import type { DecisionRuntime, LoadableModel, ModelState, ProgressCallback } from "./modelTypes";
 
-/** Everything D1OmniModel.probability() needs, available once the model is loaded. */
-type D1Inference = {
-    model: PreTrainedModel;
-    tokenizer: PreTrainedTokenizer;
-    maxLength: number; // longest request the model accepts, in tokens
-    temperature: number; // calibration: divides the scores before they become a probability
-};
-
-/** LiquidAI d1-omni-600M, a yes/no decision encoder. Reference code: https://huggingface.co/LiquidAI/d1-omni-600M */
-export class D1OmniModel implements FilteringModel {
+/** LiquidAI d1-omni-600M's files and lifecycle: is it downloaded, and loading it. Reference: https://huggingface.co/LiquidAI/d1-omni-600M */
+export class D1OmniModel implements LoadableModel<D1OmniRuntime> {
     private static readonly REPO = "onnx-community/d1-omni-600M-ONNX";
-
-    /** Section markers d1 was trained on: <bos> <state> text <q> question <opt> <mask> option </opt> … <decide> */
-    private static readonly TOKENS = {
-        state: "<|reserved_7|>", // starts the text being judged ("state" in d1's terms)
-        question: "<|reserved_8|>", // starts the question
-        option: "<|reserved_9|>", // opens one answer option
-        optionEnd: "<|reserved_10|>", // closes it
-        decide: "<|reserved_11|>", // ends the request: "now decide"
-        marker: "<|mask|>", // one per option: where the decision head reads that option's score
-    };
-
-    /** d1's question types: choice = 0, score = 1, yes/no ("noul") = 2. */
-    private static readonly YES_NO_QUESTION_TYPE = 2;
-
-    /** prompt.py's token limits, worked out for a yes/no question (2 options). */
-    private static readonly QUESTION_MAX_TOKENS = 96;
-    private static readonly OPTION_MAX_TOKENS = 45;
 
     private _state: ModelState = "unknown";
     /** d1's config.json from its Hugging Face repo (not Placid's settings). */
     private modelRepoConfig: PretrainedConfig | null = null;
-    private inference: D1Inference | null = null; // set once load() finishes
-    private sharedLoad: Promise<D1Inference> | null = null; // started by the first load(); later calls wait for it
+    private sharedLoad: Promise<D1OmniRuntime> | null = null; // started by the first load(); later calls wait for it
 
-    private readonly question: string;
-    private readonly options: [no: string, yes: string];
-    private readonly threshold: number;
     private readonly device: DeviceType;
     private readonly dtype: Extract<DataType, "q8" | "q4">;
 
     constructor(options: {
-        /** The yes/no filter question, e.g. "Is this text about politics?" */
-        question: string;
-        /** Optional descriptions of what "yes" and "no" mean. d1 has generic defaults. */
-        criteria?: { true?: string; false?: string };
-        /** P(yes) at or above this means "filter it". */
-        threshold?: number;
         /** Where the model runs: "webgpu" (GPU, default) or "wasm" (CPU, in the browser). */
         device?: DeviceType;
         /** "q4" (0.24 GB, default) or "q8" (0.41 GB). */
         dtype?: Extract<DataType, "q8" | "q4">;
-    }) {
-        this.question = options.question;
-        // A yes/no question is read as two options, "false" first (prompt.py render_options).
-        this.options = [
-            "false: " + (options.criteria?.false || "no, the statement does not hold"),
-            "true: " + (options.criteria?.true || "yes, the statement holds"),
-        ];
-        this.threshold = options.threshold ?? 0.5;
+    } = {}) {
         this.device = options.device ?? "webgpu";
         this.dtype = options.dtype ?? "q4";
     }
@@ -79,8 +37,6 @@ export class D1OmniModel implements FilteringModel {
     get state(): ModelState {
         return this._state;
     }
-
-    // ------------------------------------------------------------------ lifecycle
 
     /** Startup only: looks in the browser cache to replace "unknown" with "downloaded" or "not-downloaded". */
     async checkState(): Promise<ModelState> {
@@ -90,12 +46,13 @@ export class D1OmniModel implements FilteringModel {
         return this._state;
     }
 
-    /** Downloads the model files if needed and loads the model into memory, after which request() works. */
-    async load(onProgress?: ProgressCallback): Promise<void> {
+    /** Downloads the model files if needed and loads the model into memory. */
+    async load(onProgress?: ProgressCallback): Promise<D1OmniRuntime> {
         this.sharedLoad ??= this.downloadAndLoad(onProgress);
         try {
-            this.inference = await this.sharedLoad;
+            const runtime = await this.sharedLoad;
             this._state = "ready";
+            return runtime;
         } catch (error) {
             this.sharedLoad = null; // so the next load() starts over
             this._state = "error";
@@ -110,7 +67,7 @@ export class D1OmniModel implements FilteringModel {
     }
 
     /** Downloads any missing model files, then loads the model into memory. */
-    private async downloadAndLoad(onProgress?: ProgressCallback): Promise<D1Inference> {
+    private async downloadAndLoad(onProgress?: ProgressCallback): Promise<D1OmniRuntime> {
         this._state = "loading";
         const needsDownload = !(await this.modelFilesInBrowserCache());
         const modelRepoConfig = await this.getModelRepoConfig();
@@ -129,13 +86,13 @@ export class D1OmniModel implements FilteringModel {
         });
 
         const d1Fields = modelRepoConfig as any; // d1-specific fields that PretrainedConfig doesn't type
-        return {
+        return new D1OmniRuntime(
             model,
             tokenizer,
-            maxLength: d1Fields.max_length ?? 16384,
+            d1Fields.max_length ?? 16384,
             // d1 keeps one temperature per question type and option count; ours is yes/no with 2 options.
-            temperature: d1Fields.temperatures?.["noul:2"] ?? d1Fields.temperatures?.["noul"] ?? 1,
-        };
+            d1Fields.temperatures?.["noul:2"] ?? d1Fields.temperatures?.["noul"] ?? 1,
+        );
     }
 
     /** d1's config.json is missing the flag saying its weights are in a separate .onnx_data file; we add it so the cache check and progress include that file. */
@@ -147,223 +104,98 @@ export class D1OmniModel implements FilteringModel {
         }
         return this.modelRepoConfig;
     }
+}
 
-    // ------------------------------------------------------------------ inference
+/** A loaded d1-omni-600M that answers yes/no questions about texts. Get one from D1OmniModel.load(). */
+export class D1OmniRuntime implements DecisionRuntime {
+    /** Section markers d1 was trained on: <bos> <state> text <q> question <opt> <mask> option </opt> … <decide> */
+    private static readonly TOKENS = {
+        state: "<|reserved_7|>", // starts the text being judged ("state" in d1's terms)
+        question: "<|reserved_8|>", // starts the question
+        option: "<|reserved_9|>", // opens one answer option
+        optionEnd: "<|reserved_10|>", // closes it
+        decide: "<|reserved_11|>", // ends the request: "now decide"
+        marker: "<|mask|>", // one per option: where the decision head reads that option's score
+    };
 
-    async request(text: string): Promise<boolean> {
-        return (await this.probability(text)) >= this.threshold;
+    /** d1's question types: choice = 0, score = 1, yes/no ("noul") = 2. */
+    private static readonly YES_NO_QUESTION_TYPE = 2;
+
+    /** prompt.py's token limits, worked out for a yes/no question (2 options). */
+    private static readonly QUESTION_MAX_TOKENS = 96;
+    private static readonly OPTION_MAX_TOKENS = 45;
+
+    private readonly model: PreTrainedModel;
+    private readonly tokenizer: PreTrainedTokenizer;
+    private readonly maxLength: number; // longest request the model accepts, in tokens
+    private readonly temperature: number; // calibration: divides the scores before they become a probability
+
+    constructor(model: PreTrainedModel, tokenizer: PreTrainedTokenizer, maxLength: number, temperature: number) {
+        this.model = model;
+        this.tokenizer = tokenizer;
+        this.maxLength = maxLength;
+        this.temperature = temperature;
     }
 
-    /** P(yes) for this model's question over `text`, between 0 and 1. */
-    async probability(text: string): Promise<number> {
-        if (!this.inference) {
-            throw new Error(`D1OmniModel is not loaded (state: ${this._state}); call load() first`);
-        }
-        const { model, tokenizer, maxLength, temperature } = this.inference;
-        const { ids, markers } = this.encode(text, tokenizer, maxLength);
-        const int64 = D1OmniModel.int64Tensor;
+    /**
+     * P(yes) for `question` about `text`, between 0 and 1.
+     * `criteria` optionally describes what "yes" and "no" mean; d1 has generic defaults.
+     */
+    async probability(text: string, question: string, criteria?: { true?: string; false?: string }): Promise<number> {
+        // A yes/no question is read as two options, "false" first (prompt.py render_options).
+        const options = [
+            "false: " + (criteria?.false || "no, the statement does not hold"),
+            "true: " + (criteria?.true || "yes, the statement holds"),
+        ];
+        const { ids, markers } = this.encode(text, question, options);
+        const int64 = D1OmniRuntime.int64Tensor;
 
-        const { logits } = await model({
+        const { logits } = await this.model({
             input_ids: int64(ids),
             attention_mask: int64(ids.map(() => 1)), // 1 = look at this token (all of them)
             prefix_len: int64([0], [1]), // number of image/audio tokens before the text: none
             marker_pos: int64(markers),
             marker_mask: int64(markers.map(() => 1)),
-            qtype: int64([D1OmniModel.YES_NO_QUESTION_TYPE], [1]),
+            qtype: int64([D1OmniRuntime.YES_NO_QUESTION_TYPE], [1]),
         });
 
         // One score per option, in option order: [false, true].
         const [noScore, yesScore] = logits.data as Float32Array;
 
         // Softmax over two options = sigmoid of the score difference.
-        return 1 / (1 + Math.exp((noScore - yesScore) / temperature));
+        return 1 / (1 + Math.exp((noScore - yesScore) / this.temperature));
     }
 
     /** Port of d1's prompt.py `encode()` for one yes/no question. */
-    private encode(text: string, tokenizer: PreTrainedTokenizer, maxLength: number) {
-        const TOKENS = D1OmniModel.TOKENS;
-        const tokenId = (token: string) => tokenizer.convert_tokens_to_ids(token);
-        const tokenize = (s: string) => D1OmniModel.tokenize(tokenizer, s);
+    private encode(text: string, questionText: string, options: string[]) {
+        const TOKENS = D1OmniRuntime.TOKENS;
+        const tokenId = (token: string) => this.tokenizer.convert_tokens_to_ids(token);
+        const tokenize = (s: string) => this.tokenize(s);
 
         //   <q> question <opt> <mask> false: … </opt> <opt> <mask> true: … </opt> <decide>
-        const question = [tokenId(TOKENS.question), ...tokenize(this.question)].slice(0, D1OmniModel.QUESTION_MAX_TOKENS);
+        const question = [tokenId(TOKENS.question), ...tokenize(questionText)].slice(0, D1OmniRuntime.QUESTION_MAX_TOKENS);
         const markerOffsets: number[] = []; // where each <mask> sits inside `question`
-        for (const option of this.options) {
+        for (const option of options) {
             question.push(tokenId(TOKENS.option));
             markerOffsets.push(question.length);
-            question.push(tokenId(TOKENS.marker), ...tokenize(" " + option).slice(0, D1OmniModel.OPTION_MAX_TOKENS), tokenId(TOKENS.optionEnd));
+            question.push(tokenId(TOKENS.marker), ...tokenize(" " + option).slice(0, D1OmniRuntime.OPTION_MAX_TOKENS), tokenId(TOKENS.optionEnd));
         }
         question.push(tokenId(TOKENS.decide));
 
         //   <bos> <state> page text — cut so the whole request fits in maxLength
-        const room = maxLength - question.length - 2;
-        const page = [tokenizer.bos_token_id, tokenId(TOKENS.state), ...tokenize(text).slice(0, room)];
+        const room = this.maxLength - question.length - 2;
+        const page = [this.tokenizer.bos_token_id, tokenId(TOKENS.state), ...tokenize(text).slice(0, room)];
 
         return { ids: [...page, ...question], markers: markerOffsets.map((offset) => page.length + offset) };
     }
 
     /** Text -> token ids, with `<|name|>` escaped to `<¦name¦>` so page text can't fake a special token. */
-    private static tokenize(tokenizer: PreTrainedTokenizer, text: string): number[] {
+    private tokenize(text: string): number[] {
         const escaped = text.replace(/<\|([A-Za-z0-9_]+)\|>/g, "<¦$1¦>");
-        return Array.from(tokenizer(escaped, { add_special_tokens: false }).input_ids.data as BigInt64Array, Number);
+        return Array.from(this.tokenizer(escaped, { add_special_tokens: false }).input_ids.data as BigInt64Array, Number);
     }
 
     private static int64Tensor(values: number[], dims = [1, values.length]): Tensor {
         return new Tensor("int64", BigInt64Array.from(values, BigInt), dims);
-    }
-}
-
-/** Everything KevModel.probability() needs, available once the model is loaded. */
-type KevInference = { model: PreTrainedModel; tokenizer: PreTrainedTokenizer };
-
-/** Jared Palmer's Kev: Qwen3 + a pointer head that scores each option. https://huggingface.co/onnx-community/kev-4b-ONNX */
-export class KevModel implements FilteringModel {
-    private static readonly REPOS = {
-        "0.6b": "onnx-community/kev-0.6b-ONNX", // ~0.34 GB (q4f16)
-        "4b": "onnx-community/kev-4b-ONNX", // ~2.3 GB (q4f16)
-    };
-
-    /** Section markers (reused Qwen tokens): <state> text <q> question <opt> no </opt> <opt> yes </opt> <decide> */
-    private static readonly TOKENS = {
-        state: "<|fim_prefix|>", // starts the text being judged
-        question: "<|fim_middle|>", // starts the question
-        option: "<|box_start|>", // opens one answer option
-        optionEnd: "<|box_end|>", // closes it; its score is the option's score
-        decide: "<|fim_suffix|>", // ends the request
-    };
-
-    private static readonly YES_NO_OPTIONS = ["no", "yes"];
-    private static readonly MAX_TEXT_TOKENS = 8192; // page text is cut to this (model card default)
-
-    private _state: ModelState = "unknown";
-    private inference: KevInference | null = null; // set once load() finishes
-    private sharedLoad: Promise<KevInference> | null = null; // started by the first load(); later calls wait for it
-
-    private readonly repo: string;
-    private readonly question: string;
-    private readonly threshold: number;
-    private readonly device: DeviceType;
-    private readonly dtype: Extract<DataType, "q4f16" | "q4">;
-
-    constructor(options: {
-        /** The yes/no filter question, e.g. "Is this text about politics?" */
-        question: string;
-        /** P(yes) at or above this means "filter it". */
-        threshold?: number;
-        /** "4b" = more accurate, "0.6b" = smaller and faster. */
-        size?: keyof typeof KevModel.REPOS;
-        /** Where the model runs: "webgpu" (GPU, default) or "wasm" (CPU, in the browser). */
-        device?: DeviceType;
-        /** "q4f16" (default, faster, needs WebGPU shader-f16) or "q4" (runs on any WebGPU). */
-        dtype?: Extract<DataType, "q4f16" | "q4">;
-    }) {
-        this.question = options.question;
-        this.threshold = options.threshold ?? 0.5;
-        this.repo = KevModel.REPOS[options.size ?? "4b"];
-        this.device = options.device ?? "webgpu";
-        this.dtype = options.dtype ?? "q4f16";
-    }
-
-    get state(): ModelState {
-        return this._state;
-    }
-
-    // ------------------------------------------------------------------ lifecycle
-
-    /** Startup only: looks in the browser cache to replace "unknown" with "downloaded" or "not-downloaded". */
-    async checkState(): Promise<ModelState> {
-        if (this._state === "unknown") {
-            this._state = (await this.modelFilesInBrowserCache()) ? "downloaded" : "not-downloaded";
-        }
-        return this._state;
-    }
-
-    /** Downloads the model files if needed and loads the model into memory, after which request() works. */
-    async load(onProgress?: ProgressCallback): Promise<void> {
-        this.sharedLoad ??= this.downloadAndLoad(onProgress);
-        try {
-            this.inference = await this.sharedLoad;
-            this._state = "ready";
-        } catch (error) {
-            this.sharedLoad = null; // so the next load() starts over
-            this._state = "error";
-            throw error;
-        }
-    }
-
-    /** True when every file the model needs is already in the browser's download cache. */
-    private async modelFilesInBrowserCache(): Promise<boolean> {
-        return ModelRegistry.is_cached(this.repo, { dtype: this.dtype });
-    }
-
-    /** Downloads any missing model files, then loads the model into memory. */
-    private async downloadAndLoad(onProgress?: ProgressCallback): Promise<KevInference> {
-        this._state = "loading";
-        const needsDownload = !(await this.modelFilesInBrowserCache());
-        const tokenizer = await AutoTokenizer.from_pretrained(this.repo);
-        const model = await PreTrainedModel.from_pretrained(this.repo, {
-            dtype: this.dtype,
-            device: this.device,
-            progress_callback: (info: ProgressInfo) => {
-                if (info.status !== "progress_total") return;
-                // transformers.js reports progress for cache reads too, so only a real download is "downloading".
-                this._state = needsDownload && info.progress < 100 ? "downloading" : "loading";
-                onProgress?.(info.progress);
-            },
-        });
-        return { model, tokenizer };
-    }
-
-    // ------------------------------------------------------------------ inference
-
-    async request(text: string): Promise<boolean> {
-        return (await this.probability(text)) >= this.threshold;
-    }
-
-    /** P(yes) for this model's question over `text`, between 0 and 1. */
-    async probability(text: string): Promise<number> {
-        if (!this.inference) {
-            throw new Error(`KevModel is not loaded (state: ${this._state}); call load() first`);
-        }
-        const { model, tokenizer } = this.inference;
-        const { ids, optionEnds } = this.encode(text, tokenizer);
-        const int64 = (values: number[]) => new Tensor("int64", BigInt64Array.from(values, BigInt), [1, values.length]);
-
-        // One score per token; only the scores at each option's </opt> mean anything.
-        const { logits } = await model({ input_ids: int64(ids), attention_mask: int64(ids.map(() => 1)) });
-        const scores = logits.to("float32").data as Float32Array;
-        const [noScore, yesScore] = optionEnds.map((i) => scores[i]);
-
-        // Softmax over two options = sigmoid of the score difference.
-        return 1 / (1 + Math.exp(noScore - yesScore));
-    }
-
-    /** Port of the model card's prompt layout for one yes/no question. */
-    private encode(text: string, tokenizer: PreTrainedTokenizer) {
-        const TOKENS = KevModel.TOKENS;
-        const tokenId = (token: string) => tokenizer.convert_tokens_to_ids(token);
-        const tokenize = (s: string) => KevModel.tokenize(tokenizer, s);
-
-        //   <state> page text <q> question <opt> no </opt> <opt> yes </opt> <decide>
-        const ids = [
-            tokenId(TOKENS.state),
-            ...tokenize(text).slice(0, KevModel.MAX_TEXT_TOKENS),
-            tokenId(TOKENS.question),
-            ...tokenize(this.question),
-        ];
-        const optionEnds: number[] = []; // where each </opt> sits in `ids`
-        for (const option of KevModel.YES_NO_OPTIONS) {
-            ids.push(tokenId(TOKENS.option), ...tokenize(option), tokenId(TOKENS.optionEnd));
-            optionEnds.push(ids.length - 1);
-        }
-        ids.push(tokenId(TOKENS.decide));
-
-        return { ids, optionEnds };
-    }
-
-    /** Text -> token ids, with `<|name|>` escaped to `<¦name¦>` so page text can't fake a special token. */
-    private static tokenize(tokenizer: PreTrainedTokenizer, text: string): number[] {
-        const escaped = text.replace(/<\|([A-Za-z0-9_]+)\|>/g, "<¦$1¦>");
-        return Array.from(tokenizer(escaped, { add_special_tokens: false }).input_ids.data as BigInt64Array, Number);
     }
 }
