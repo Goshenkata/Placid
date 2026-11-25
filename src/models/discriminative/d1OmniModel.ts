@@ -9,7 +9,7 @@ import {
     type ProgressInfo,
 } from "@huggingface/transformers";
 import type { Model, ModelState, ProgressCallback } from "../modelTypes";
-import { D1OmniSession } from "./d1OmniSession";
+import { D1OmniSession } from "./d1OmniSession.ts";
 
 /** LiquidAI d1-omni-600M's files and lifecycle: is it downloaded, and loading it. Reference: https://huggingface.co/LiquidAI/d1-omni-600M */
 export class D1OmniModel implements Model<D1OmniSession> {
@@ -19,6 +19,7 @@ export class D1OmniModel implements Model<D1OmniSession> {
     /** d1's config.json from its Hugging Face repo (not Placid's settings). */
     private modelRepoConfig: PretrainedConfig | null = null;
     private sharedLoad: Promise<D1OmniSession> | null = null; // started by the first load(); later calls wait for it
+    private progressListeners = new Set<ProgressCallback>(); // onProgress of every load() call still waiting
 
     private readonly device: DeviceType;
     private readonly dtype: Extract<DataType, "q8" | "q4">;
@@ -47,7 +48,8 @@ export class D1OmniModel implements Model<D1OmniSession> {
 
     /** Downloads the model files if needed and loads the model into memory. */
     async load(onProgress?: ProgressCallback): Promise<D1OmniSession> {
-        this.sharedLoad ??= this.downloadAndLoad(onProgress);
+        if (onProgress) this.progressListeners.add(onProgress);
+        this.sharedLoad ??= this.downloadAndLoad();
         try {
             const session = await this.sharedLoad;
             this._state = "ready";
@@ -56,7 +58,19 @@ export class D1OmniModel implements Model<D1OmniSession> {
             this.sharedLoad = null; // so the next load() starts over
             this._state = "error";
             throw error;
+        } finally {
+            if (onProgress) this.progressListeners.delete(onProgress);
         }
+    }
+
+    /** Frees the model's GPU memory. Sessions from earlier load() calls stop working; the files stay cached. */
+    async unload(): Promise<void> {
+        const loading = this.sharedLoad;
+        if (!loading) return;
+        this.sharedLoad = null; // the next load() loads again
+        const session = await loading;
+        this._state = "downloaded";
+        await session.dispose();
     }
 
     /** True when every file the model needs is already in the browser's download cache. */
@@ -66,9 +80,9 @@ export class D1OmniModel implements Model<D1OmniSession> {
     }
 
     /** Downloads any missing model files, then loads the model into memory. */
-    private async downloadAndLoad(onProgress?: ProgressCallback): Promise<D1OmniSession> {
-        this._state = "loading";
+    private async downloadAndLoad(): Promise<D1OmniSession> {
         const needsDownload = !(await this.modelFilesInBrowserCache());
+        this._state = needsDownload ? "downloading" : "loading";
         const modelRepoConfig = await this.getModelRepoConfig();
         const tokenizer = await AutoTokenizer.from_pretrained(D1OmniModel.REPO);
         const model = await PreTrainedModel.from_pretrained(D1OmniModel.REPO, {
@@ -80,7 +94,9 @@ export class D1OmniModel implements Model<D1OmniSession> {
                 if (info.status !== "progress_total") return;
                 // transformers.js reports progress for cache reads too, so only a real download is "downloading".
                 this._state = needsDownload && info.progress < 100 ? "downloading" : "loading";
-                onProgress?.(info.progress);
+                for (const listener of this.progressListeners) {
+                    listener(info.progress);
+                }
             },
         });
 
