@@ -138,7 +138,7 @@ export class D1OmniModel implements FilteringModel {
         };
     }
 
-    /** d1's config.json forgets its weights live in `.onnx_data`; without this fix the cache check misses them. */
+    /** d1's config.json is missing the flag saying its weights are in a separate .onnx_data file; we add it so the cache check and progress include that file. */
     private async getModelRepoConfig(): Promise<PretrainedConfig> {
         if (!this.modelRepoConfig) {
             const fromRepo = (await AutoConfig.from_pretrained(D1OmniModel.REPO)) as any;
