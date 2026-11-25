@@ -27,26 +27,36 @@ export class D1OmniSession implements ProbabilitySession {
     private readonly tokenizer: PreTrainedTokenizer;
     private readonly maxLength: number; // longest request the model accepts, in tokens
     private readonly temperature: number; // calibration: divides the scores before they become a probability
+    private readonly tokenIds: Record<keyof typeof D1OmniSession.TOKENS, number>; // TOKENS as token ids
 
     constructor(model: PreTrainedModel, tokenizer: PreTrainedTokenizer, maxLength: number, temperature: number) {
         this.model = model;
         this.tokenizer = tokenizer;
         this.maxLength = maxLength;
         this.temperature = temperature;
+
+        const TOKENS = D1OmniSession.TOKENS;
+        this.tokenIds = {
+            state: tokenizer.convert_tokens_to_ids(TOKENS.state),
+            question: tokenizer.convert_tokens_to_ids(TOKENS.question),
+            option: tokenizer.convert_tokens_to_ids(TOKENS.option),
+            optionEnd: tokenizer.convert_tokens_to_ids(TOKENS.optionEnd),
+            decide: tokenizer.convert_tokens_to_ids(TOKENS.decide),
+            marker: tokenizer.convert_tokens_to_ids(TOKENS.marker),
+        };
     }
 
     /** P(yes) for `question` about `text`, between 0 and 1. */
     async probability(text: string, question: string): Promise<number> {
         const { ids, markers } = this.encode(text, question);
-        const int64 = D1OmniSession.int64Tensor;
 
         const { logits } = await this.model({
-            input_ids: int64(ids),
-            attention_mask: int64(ids.map(() => 1)), // 1 = look at this token (all of them)
-            prefix_len: int64([0], [1]), // number of image/audio tokens before the text: none
-            marker_pos: int64(markers),
-            marker_mask: int64(markers.map(() => 1)),
-            qtype: int64([D1OmniSession.YES_NO_QUESTION_TYPE], [1]),
+            input_ids: int64Tensor(ids),
+            attention_mask: int64Tensor(ids.map(() => 1)), // 1 = look at this token (all of them)
+            prefix_len: int64Tensor([0], [1]), // number of image/audio tokens before the text: none
+            marker_pos: int64Tensor(markers),
+            marker_mask: int64Tensor(markers.map(() => 1)),
+            qtype: int64Tensor([D1OmniSession.YES_NO_QUESTION_TYPE], [1]),
         });
 
         // One score per option, in option order: [false, true].
@@ -56,27 +66,28 @@ export class D1OmniSession implements ProbabilitySession {
         return 1 / (1 + Math.exp((noScore - yesScore) / this.temperature));
     }
 
-    /** Port of d1's prompt.py `encode()` for one yes/no question. */
-    private encode(text: string, questionText: string) {
-        const TOKENS = D1OmniSession.TOKENS;
-        const tokenId = (token: string) => this.tokenizer.convert_tokens_to_ids(token);
-        const tokenize = (s: string) => this.tokenize(s);
+    /** Builds d1's input for one yes/no question (port of prompt.py `encode()`). `markers` are the <mask> positions. */
+    private encode(text: string, question: string): { ids: number[]; markers: number[] } {
+        const { state, question: questionStart, option, optionEnd, decide, marker } = this.tokenIds;
 
-        //   <q> question <opt> <mask> false: … </opt> <opt> <mask> true: … </opt> <decide>
-        const question = [tokenId(TOKENS.question), ...tokenize(questionText)].slice(0, D1OmniSession.QUESTION_MAX_TOKENS);
-        const markerOffsets: number[] = []; // where each <mask> sits inside `question`
-        for (const option of D1OmniSession.OPTIONS) {
-            question.push(tokenId(TOKENS.option));
-            markerOffsets.push(question.length);
-            question.push(tokenId(TOKENS.marker), ...tokenize(" " + option).slice(0, D1OmniSession.OPTION_MAX_TOKENS), tokenId(TOKENS.optionEnd));
+        // <q> question <opt> <mask> false: … </opt> <opt> <mask> true: … </opt> <decide>
+        const questionPart = [questionStart, ...this.tokenize(question)].slice(0, D1OmniSession.QUESTION_MAX_TOKENS);
+        const markerOffsets: number[] = [];
+        for (const optionText of D1OmniSession.OPTIONS) {
+            questionPart.push(option);
+            markerOffsets.push(questionPart.length);
+            questionPart.push(marker, ...this.tokenize(" " + optionText).slice(0, D1OmniSession.OPTION_MAX_TOKENS), optionEnd);
         }
-        question.push(tokenId(TOKENS.decide));
+        questionPart.push(decide);
 
-        //   <bos> <state> page text — cut so the whole request fits in maxLength
-        const room = this.maxLength - question.length - 2;
-        const page = [this.tokenizer.bos_token_id, tokenId(TOKENS.state), ...tokenize(text).slice(0, room)];
+        // <bos> <state> text, cut so the whole input fits in maxLength
+        const room = this.maxLength - questionPart.length - 2;
+        const textPart = [this.tokenizer.bos_token_id, state, ...this.tokenize(text).slice(0, room)];
 
-        return { ids: [...page, ...question], markers: markerOffsets.map((offset) => page.length + offset) };
+        return {
+            ids: [...textPart, ...questionPart],
+            markers: markerOffsets.map((offset) => textPart.length + offset),
+        };
     }
 
     /** Text -> token ids, with `<|name|>` escaped to `<¦name¦>` so page text can't fake a special token. */
@@ -84,8 +95,8 @@ export class D1OmniSession implements ProbabilitySession {
         const escaped = text.replace(/<\|([A-Za-z0-9_]+)\|>/g, "<¦$1¦>");
         return Array.from(this.tokenizer(escaped, { add_special_tokens: false }).input_ids.data as BigInt64Array, Number);
     }
+}
 
-    private static int64Tensor(values: number[], dims = [1, values.length]): Tensor {
-        return new Tensor("int64", BigInt64Array.from(values, BigInt), dims);
-    }
+function int64Tensor(values: number[], dims = [1, values.length]): Tensor {
+    return new Tensor("int64", BigInt64Array.from(values, BigInt), dims);
 }
