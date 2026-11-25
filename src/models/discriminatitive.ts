@@ -53,8 +53,14 @@ export class D1OmniModel implements FilteringModel {
     private static readonly OPTION_MAX_TOKENS = 45;
 
     private _state: ModelState = "unknown";
-    private config: PretrainedConfig | null = null;
-    private loaded: {
+    /**
+     * d1's own config.json from its Hugging Face repo (architecture, max length, calibration
+     * temperatures), with our external-data fix applied. Not Placid's settings.
+     * Needed before the model is loaded, to check the cache.
+     */
+    private modelRepoConfig: PretrainedConfig | null = null;
+    /** Everything probability() needs; null until load() finishes. */
+    private inference: {
         model: PreTrainedModel;
         tokenizer: PreTrainedTokenizer;
         maxLength: number; // longest request the model accepts, in tokens
@@ -75,12 +81,11 @@ export class D1OmniModel implements FilteringModel {
         criteria?: { true?: string; false?: string };
         /** P(yes) at or above this means "filter it". */
         threshold?: number;
-        /** "webgpu" in the browser; "cpu" when testing in Node. */
+        /** Where the model runs: "webgpu" (GPU, default) or "wasm" (CPU, in the browser). */
         device?: DeviceType;
         /**
          * Which published quantization to load:
          * "q4" = model_q4.onnx (0.24 GB), "q8" = model_quantized.onnx (0.41 GB).
-         * Same accuracy on JevBench (74.1% vs 73.5%); q4 is smaller and slightly faster.
          */
         dtype?: Extract<DataType, "q8" | "q4">;
     }) {
@@ -136,14 +141,14 @@ export class D1OmniModel implements FilteringModel {
         if (this._state === "ready") return;
 
         return this.startJob(async () => {
-            this.loaded = await this.loadFromHub(onProgress);
+            this.inference = await this.loadFromHub(onProgress);
             this._state = "ready";
         });
     }
 
     private async isCached(): Promise<boolean> {
         const { files } = await ModelRegistry.is_cached_files(D1OmniModel.REPO, {
-            config: await this.getConfig(),
+            config: await this.getModelRepoConfig(),
             dtype: this.dtype,
         });
         // preprocessor_config.json is only used for images, so text-only use never downloads it.
@@ -164,13 +169,13 @@ export class D1OmniModel implements FilteringModel {
     }
 
     /** Downloads what is missing from the cache, then loads the model into memory. */
-    private async loadFromHub(onProgress?: ProgressCallback): Promise<NonNullable<D1OmniModel["loaded"]>> {
-        const config = await this.getConfig();
+    private async loadFromHub(onProgress?: ProgressCallback): Promise<NonNullable<D1OmniModel["inference"]>> {
+        const modelRepoConfig = await this.getModelRepoConfig();
         const tokenizer = await AutoTokenizer.from_pretrained(D1OmniModel.REPO);
 
         this._state = "loading";
         const model = await PreTrainedModel.from_pretrained(D1OmniModel.REPO, {
-            config,
+            config: modelRepoConfig,
             dtype: this.dtype,
             device: this.device,
             use_external_data_format: true,
@@ -182,28 +187,28 @@ export class D1OmniModel implements FilteringModel {
             },
         });
 
-        const settings = config as any; // d1-specific fields that PretrainedConfig doesn't type
+        const d1Fields = modelRepoConfig as any; // d1-specific fields that PretrainedConfig doesn't type
         return {
             model,
             tokenizer,
-            maxLength: settings.max_length ?? 16384,
+            maxLength: d1Fields.max_length ?? 16384,
             // d1 keeps one temperature per question type and option count; ours is yes/no with 2 options.
-            temperature: settings.temperatures?.["noul:2"] ?? settings.temperatures?.["noul"] ?? 1,
+            temperature: d1Fields.temperatures?.["noul:2"] ?? d1Fields.temperatures?.["noul"] ?? 1,
         };
     }
 
     /**
-     * config.json, with one fix: it doesn't say the weights live in a separate `.onnx_data`
+     * d1's config.json, with one fix: it doesn't say the weights live in a separate `.onnx_data`
      * file, so transformers.js would miss that file when checking the cache and when
      * computing download progress.
      */
-    private async getConfig(): Promise<PretrainedConfig> {
-        if (!this.config) {
-            const config = (await AutoConfig.from_pretrained(D1OmniModel.REPO)) as any;
-            config["transformers.js_config"] = { ...config["transformers.js_config"], use_external_data_format: true };
-            this.config = config as PretrainedConfig;
+    private async getModelRepoConfig(): Promise<PretrainedConfig> {
+        if (!this.modelRepoConfig) {
+            const fromRepo = (await AutoConfig.from_pretrained(D1OmniModel.REPO)) as any;
+            fromRepo["transformers.js_config"] = { ...fromRepo["transformers.js_config"], use_external_data_format: true };
+            this.modelRepoConfig = fromRepo as PretrainedConfig;
         }
-        return this.config;
+        return this.modelRepoConfig;
     }
 
     // ------------------------------------------------------------------ inference
@@ -214,10 +219,10 @@ export class D1OmniModel implements FilteringModel {
 
     /** P(yes) for this model's question over `text`, between 0 and 1. */
     async probability(text: string): Promise<number> {
-        if (!this.loaded) {
+        if (!this.inference) {
             throw new Error(`D1OmniModel is not loaded (state: ${this._state}); call load() first`);
         }
-        const { model, tokenizer, maxLength, temperature } = this.loaded;
+        const { model, tokenizer, maxLength, temperature } = this.inference;
         const { ids, markers } = this.encode(text, tokenizer, maxLength);
         const int64 = D1OmniModel.int64Tensor;
 
@@ -305,7 +310,8 @@ export class KevModel implements FilteringModel {
     private static readonly MAX_TEXT_TOKENS = 8192; // page text is cut to this (model card default)
 
     private _state: ModelState = "unknown";
-    private loaded: { model: PreTrainedModel; tokenizer: PreTrainedTokenizer } | null = null;
+    /** Everything probability() needs; null until load() finishes. */
+    private inference: { model: PreTrainedModel; tokenizer: PreTrainedTokenizer } | null = null;
     private pending: Promise<void> | null = null; // the download/load currently running, if any
 
     private readonly repo: string;
@@ -319,9 +325,9 @@ export class KevModel implements FilteringModel {
         question: string;
         /** P(yes) at or above this means "filter it". */
         threshold?: number;
-        /** "4b" = most accurate (JevBench 86%), "0.6b" = small and fast (76%). */
+        /** "4b" = more accurate, "0.6b" = smaller and faster. */
         size?: keyof typeof KevModel.REPOS;
-        /** "webgpu" in the browser; "cpu" when testing in Node. */
+        /** Where the model runs: "webgpu" (GPU, default) or "wasm" (CPU, in the browser). */
         device?: DeviceType;
         /**
          * Which published quantization to load. Both have 4-bit weights and the same accuracy.
@@ -378,7 +384,7 @@ export class KevModel implements FilteringModel {
         if (this._state === "ready") return;
 
         return this.startJob(async () => {
-            this.loaded = await this.loadFromHub(onProgress);
+            this.inference = await this.loadFromHub(onProgress);
             this._state = "ready";
         });
     }
@@ -402,7 +408,7 @@ export class KevModel implements FilteringModel {
     }
 
     /** Downloads what is missing from the cache, then loads the model into memory. */
-    private async loadFromHub(onProgress?: ProgressCallback): Promise<NonNullable<KevModel["loaded"]>> {
+    private async loadFromHub(onProgress?: ProgressCallback): Promise<NonNullable<KevModel["inference"]>> {
         const tokenizer = await AutoTokenizer.from_pretrained(this.repo);
 
         this._state = "loading";
@@ -427,10 +433,10 @@ export class KevModel implements FilteringModel {
 
     /** P(yes) for this model's question over `text`, between 0 and 1. */
     async probability(text: string): Promise<number> {
-        if (!this.loaded) {
+        if (!this.inference) {
             throw new Error(`KevModel is not loaded (state: ${this._state}); call load() first`);
         }
-        const { model, tokenizer } = this.loaded;
+        const { model, tokenizer } = this.inference;
         const { ids, optionEnds } = this.encode(text, tokenizer);
         const int64 = (values: number[]) => new Tensor("int64", BigInt64Array.from(values, BigInt), [1, values.length]);
 
