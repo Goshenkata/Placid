@@ -249,3 +249,185 @@ export class D1OmniModel implements FilteringModel {
         return this.config;
     }
 }
+
+export class KevModel implements FilteringModel {
+    // Jared Palmer's Kev: Qwen3 + LoRA + a pointer head that scores each option.
+    // Model card + reference code: https://huggingface.co/onnx-community/kev-4b-ONNX
+    private static readonly REPOS = {
+        "0.6b": "onnx-community/kev-0.6b-ONNX", // ~0.34 GB (q4f16)
+        "4b": "onnx-community/kev-4b-ONNX", // ~2.3 GB (q4f16)
+    };
+
+    // Existing Qwen tokens Kev reuses to lay out a request (from the model card).
+    private static readonly TOKENS = {
+        state: "<|fim_prefix|>",
+        question: "<|fim_middle|>",
+        option: "<|box_start|>",
+        optionEnd: "<|box_end|>",
+        decide: "<|fim_suffix|>",
+    };
+
+    private static readonly NOUL_OPTIONS = ["no", "yes"]; // a yes/no question is two options
+    private static readonly MAX_STATE_TOKENS = 8192; // page text is cut to this (model card default)
+
+    private _state: ModelState = "unknown";
+    private tokenizer: PreTrainedTokenizer | null = null;
+    private model: PreTrainedModel | null = null;
+    private pending: Promise<void> | null = null; // the download/load currently running, if any
+
+    private readonly repo: string;
+    private readonly question: string;
+    private readonly threshold: number;
+    private readonly device: DeviceType;
+    private readonly dtype: Extract<DataType, "q4f16" | "q4">;
+
+    constructor(options: {
+        /** The yes/no filter question, e.g. "Is this text about politics?" */
+        question: string;
+        /** P(yes) at or above this means "filter it". */
+        threshold?: number;
+        /** "4b" = most accurate (JevBench 86%), "0.6b" = small and fast (76%). */
+        size?: keyof typeof KevModel.REPOS;
+        /** "webgpu" in the browser; "cpu" when testing in Node. */
+        device?: DeviceType;
+        /**
+         * Which published quantization to load. Both have 4-bit weights and the same accuracy.
+         * "q4f16" = 16-bit maths: smaller and ~2x faster on GPU, needs WebGPU's shader-f16 feature.
+         * "q4" = 32-bit maths: runs on any WebGPU device.
+         */
+        dtype?: Extract<DataType, "q4f16" | "q4">;
+    }) {
+        this.question = options.question;
+        this.threshold = options.threshold ?? 0.5;
+        this.repo = KevModel.REPOS[options.size ?? "4b"];
+        this.device = options.device ?? "webgpu";
+        this.dtype = options.dtype ?? "q4f16";
+    }
+
+    get state(): ModelState {
+        return this._state;
+    }
+
+    // ------------------------------------------------------------------ lifecycle
+
+    async checkState(): Promise<ModelState> {
+        // While something is running (or the model is in memory) we already know the state.
+        if (this.pending || this._state === "ready") {
+            return this._state;
+        }
+        try {
+            const { files } = await ModelRegistry.is_cached_files(this.repo, { dtype: this.dtype });
+            this._state = files.every((f) => f.cached) ? "downloaded" : "not-downloaded";
+        } catch (e) {
+            this._state = "error";
+            throw e;
+        }
+        return this._state;
+    }
+
+    /**
+     * Puts the files in the cache without keeping the model in memory.
+     * transformers.js has no "download only" call, so this loads the model once and frees it again.
+     */
+    async download(onProgress?: ProgressCallback): Promise<void> {
+        if (this._state === "downloaded" || this._state === "ready") return;
+        if (this.pending) return this.pending;
+
+        this.pending = (async () => {
+            const model = await this.loadModel(onProgress);
+            await model.dispose();
+            this._state = "downloaded";
+        })();
+        return this.run();
+    }
+
+    /** Downloads (if needed) and loads the model, after which request() works. */
+    async load(onProgress?: ProgressCallback): Promise<void> {
+        // If a download or load is already running, let it finish first.
+        while (this.pending) await this.pending.catch(() => {});
+        if (this._state === "ready") return;
+
+        this.pending = (async () => {
+            this.model = await this.loadModel(onProgress);
+            this._state = "ready";
+        })();
+        return this.run();
+    }
+
+    // ------------------------------------------------------------------ inference
+
+    async request(input: string): Promise<boolean> {
+        return (await this.probability(input)) >= this.threshold;
+    }
+
+    /** P(yes) for this model's question over `input`, between 0 and 1. */
+    async probability(input: string): Promise<number> {
+        if (this._state !== "ready" || !this.model || !this.tokenizer) {
+            throw new Error(`KevModel is not loaded (state: ${this._state}); call load() first`);
+        }
+
+        const { ids, optionEnds } = this.encode(input);
+        const int64 = (values: number[]) =>
+            new Tensor("int64", BigInt64Array.from(values, BigInt), [1, values.length]);
+
+        // One score per token; only the scores at each option's </opt> mean anything.
+        const { logits } = await this.model({ input_ids: int64(ids), attention_mask: int64(ids.map(() => 1)) });
+        const scores = logits.to("float32").data as Float32Array;
+        const [noScore, yesScore] = optionEnds.map((i) => scores[i]);
+
+        // softmax over the two options, keeping P(yes)
+        return 1 / (1 + Math.exp(noScore - yesScore));
+    }
+
+    // ------------------------------------------------------------------ internals
+
+    /** Port of the model card's prompt layout for one yes/no question. */
+    private encode(state: string): { ids: number[]; optionEnds: number[] } {
+        const tok = this.tokenizer!;
+        const TOKENS = KevModel.TOKENS;
+        const id = (token: string) => tok.convert_tokens_to_ids(token);
+        // `<|name|>` -> `<¦name¦>`, so page text can never produce one of Kev's special tokens.
+        const escape = (text: string) => text.replace(/<\|([A-Za-z0-9_]+)\|>/g, "<¦$1¦>");
+        const enc = (text: string) =>
+            Array.from(tok(escape(text), { add_special_tokens: false }).input_ids.data as BigInt64Array, Number);
+
+        //   <state> page text <q> question <opt> no </opt> <opt> yes </opt> <decide>
+        const ids = [id(TOKENS.state), ...enc(state).slice(0, KevModel.MAX_STATE_TOKENS), id(TOKENS.question), ...enc(this.question)];
+        const optionEnds: number[] = [];
+        for (const text of KevModel.NOUL_OPTIONS) {
+            ids.push(id(TOKENS.option), ...enc(text), id(TOKENS.optionEnd));
+            optionEnds.push(ids.length - 1); // position of this option's </opt>
+        }
+        ids.push(id(TOKENS.decide));
+
+        return { ids, optionEnds };
+    }
+
+    private async loadModel(onProgress?: ProgressCallback): Promise<PreTrainedModel> {
+        this.tokenizer ??= await AutoTokenizer.from_pretrained(this.repo);
+
+        this._state = "loading";
+        return await PreTrainedModel.from_pretrained(this.repo, {
+            dtype: this.dtype,
+            device: this.device,
+            progress_callback: (info: ProgressInfo) => {
+                if (info.status !== "progress_total") return;
+                // While bytes are still coming in we are downloading; after that, loading.
+                this._state = info.progress < 100 ? "downloading" : "loading";
+                onProgress?.(info.progress);
+            },
+        });
+    }
+
+    /** Runs the pending download/load and keeps the state right if it fails. */
+    private async run(): Promise<void> {
+        try {
+            await this.pending;
+        } catch (e) {
+            this._state = "error";
+            throw e;
+        } finally {
+            this.pending = null;
+        }
+    }
+}
