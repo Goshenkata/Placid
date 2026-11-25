@@ -19,9 +19,8 @@ export class D1OmniSession implements ProbabilitySession {
     /** A yes/no question is read as two options, "false" first (prompt.py's default wording). */
     private static readonly OPTIONS = ["false: no, the statement does not hold", "true: yes, the statement holds"];
 
-    /** prompt.py's token limits, worked out for a yes/no question (2 options). */
-    private static readonly QUESTION_MAX_TOKENS = 96;
-    private static readonly OPTION_MAX_TOKENS = 45;
+    /** Longest question d1 was trained with, in tokens (prompt.py allows 96 including the <q> marker). */
+    private static readonly QUESTION_MAX_TOKENS = 95;
 
     private readonly model: PreTrainedModel;
     private readonly tokenizer: PreTrainedTokenizer;
@@ -66,23 +65,37 @@ export class D1OmniSession implements ProbabilitySession {
         return 1 / (1 + Math.exp((noScore - yesScore) / this.temperature));
     }
 
-    /** Builds d1's input for one yes/no question (port of prompt.py `encode()`). `markers` are the <mask> positions. */
+    /**
+     * Builds d1's input for one yes/no question (port of prompt.py `encode()`). `markers` are the <mask> positions.
+     * Throws if the question or text is too long, instead of cutting it short.
+     */
     private encode(text: string, question: string): { ids: number[]; markers: number[] } {
         const { state, question: questionStart, option, optionEnd, decide, marker } = this.tokenIds;
 
+        const questionTokens = this.tokenize(question);
+        if (questionTokens.length > D1OmniSession.QUESTION_MAX_TOKENS) {
+            throw new Error(`Question is ${questionTokens.length} tokens; d1 accepts at most ${D1OmniSession.QUESTION_MAX_TOKENS}.`);
+        }
+
         // <q> question <opt> <mask> false: … </opt> <opt> <mask> true: … </opt> <decide>
-        const questionPart = [questionStart, ...this.tokenize(question)].slice(0, D1OmniSession.QUESTION_MAX_TOKENS);
+        const questionPart = [questionStart, ...questionTokens];
         const markerOffsets: number[] = [];
         for (const optionText of D1OmniSession.OPTIONS) {
             questionPart.push(option);
             markerOffsets.push(questionPart.length);
-            questionPart.push(marker, ...this.tokenize(" " + optionText).slice(0, D1OmniSession.OPTION_MAX_TOKENS), optionEnd);
+            questionPart.push(marker, ...this.tokenize(" " + optionText), optionEnd);
         }
         questionPart.push(decide);
 
-        // <bos> <state> text, cut so the whole input fits in maxLength
-        const room = this.maxLength - questionPart.length - 2;
-        const textPart = [this.tokenizer.bos_token_id, state, ...this.tokenize(text).slice(0, room)];
+        // Whatever the question part leaves of maxLength, minus <bos> and <state>, is room for the text.
+        const textTokens = this.tokenize(text);
+        const maxTextTokens = this.maxLength - questionPart.length - 2;
+        if (textTokens.length > maxTextTokens) {
+            throw new Error(`Text is ${textTokens.length} tokens; d1 accepts at most ${maxTextTokens} with this question.`);
+        }
+
+        // <bos> <state> text
+        const textPart = [this.tokenizer.bos_token_id, state, ...textTokens];
 
         return {
             ids: [...textPart, ...questionPart],
