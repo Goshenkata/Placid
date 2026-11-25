@@ -105,17 +105,14 @@ export class D1OmniModel implements FilteringModel {
 
     /** True when every file the model needs is already in the browser's download cache. */
     private async modelFilesInBrowserCache(): Promise<boolean> {
-        const { files } = await ModelRegistry.is_cached_files(D1OmniModel.REPO, {
-            config: await this.getModelRepoConfig(),
-            dtype: this.dtype,
-        });
-        // preprocessor_config.json is only used for images, so text-only use never downloads it.
-        return files.every((f) => f.cached || f.file === "preprocessor_config.json");
+        const textOnly = { include_processor: false }; // skip d1's image/audio settings, which we never download (missing from transformers.js's types)
+        return ModelRegistry.is_cached(D1OmniModel.REPO, { config: await this.getModelRepoConfig(), dtype: this.dtype, ...textOnly });
     }
 
     /** Downloads any missing model files, then loads the model into memory. */
     private async downloadAndLoad(onProgress?: ProgressCallback): Promise<D1Inference> {
         this._state = "loading";
+        const needsDownload = !(await this.modelFilesInBrowserCache());
         const modelRepoConfig = await this.getModelRepoConfig();
         const tokenizer = await AutoTokenizer.from_pretrained(D1OmniModel.REPO);
         const model = await PreTrainedModel.from_pretrained(D1OmniModel.REPO, {
@@ -125,8 +122,8 @@ export class D1OmniModel implements FilteringModel {
             use_external_data_format: true,
             progress_callback: (info: ProgressInfo) => {
                 if (info.status !== "progress_total") return;
-                // While bytes are still coming in we are downloading; after that, loading.
-                this._state = info.progress < 100 ? "downloading" : "loading";
+                // transformers.js reports progress for cache reads too, so only a real download is "downloading".
+                this._state = needsDownload && info.progress < 100 ? "downloading" : "loading";
                 onProgress?.(info.progress);
             },
         });
@@ -296,21 +293,21 @@ export class KevModel implements FilteringModel {
 
     /** True when every file the model needs is already in the browser's download cache. */
     private async modelFilesInBrowserCache(): Promise<boolean> {
-        const { files } = await ModelRegistry.is_cached_files(this.repo, { dtype: this.dtype });
-        return files.every((f) => f.cached);
+        return ModelRegistry.is_cached(this.repo, { dtype: this.dtype });
     }
 
     /** Downloads any missing model files, then loads the model into memory. */
     private async downloadAndLoad(onProgress?: ProgressCallback): Promise<KevInference> {
         this._state = "loading";
+        const needsDownload = !(await this.modelFilesInBrowserCache());
         const tokenizer = await AutoTokenizer.from_pretrained(this.repo);
         const model = await PreTrainedModel.from_pretrained(this.repo, {
             dtype: this.dtype,
             device: this.device,
             progress_callback: (info: ProgressInfo) => {
                 if (info.status !== "progress_total") return;
-                // While bytes are still coming in we are downloading; after that, loading.
-                this._state = info.progress < 100 ? "downloading" : "loading";
+                // transformers.js reports progress for cache reads too, so only a real download is "downloading".
+                this._state = needsDownload && info.progress < 100 ? "downloading" : "loading";
                 onProgress?.(info.progress);
             },
         });
