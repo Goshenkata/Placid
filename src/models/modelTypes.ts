@@ -4,19 +4,19 @@ export type ModelState =
     | "downloading"
     | "downloaded"     // in cache, not in memory
     | "loading"
-    | "ready"          // in memory, load() has returned the runtime
+    | "ready"          // in memory, load() has returned the session
     | "error";
 
 export type ProgressCallback = (percent: number) => void;
 
 /** A model's files and lifecycle: is it downloaded, and loading it. No inference. */
-export type LoadableModel<Runtime> = {
+export type Model<Session> = {
     readonly state: ModelState;
     checkState(): Promise<ModelState>;                       // startup: replaces "unknown"
-    load(onProgress?: ProgressCallback): Promise<Runtime>;   // downloads first if needed; concurrent calls share one load
+    load(onProgress?: ProgressCallback): Promise<Session>;   // downloads first if needed; concurrent calls share one load
 };
 
-/** A loaded yes/no decision model. One runtime answers any number of questions. */
-export type DecisionRuntime = {
+/** A loaded model, ready to answer. One session answers any number of questions. */
+export type ModelSession = {
     probability(text: string, question: string): Promise<number>; // P(yes) for the question about the text, 0 to 1
 };

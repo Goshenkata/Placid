@@ -4,11 +4,13 @@
   "description": "Browser extension for context filtering with AI",
   "private": true,
   "scripts": {
-    "build": "tsc",
-    "watch": "tsc --watch"
+    "bundle": "esbuild src/background.ts src/content.ts --bundle --format=iife --target=es2022 --outdir=dist",
+    "build": "tsc --noEmit && npm run bundle",
+    "watch": "npm run bundle -- --watch"
   },
   "devDependencies": {
     "@types/chrome": "^0.3.7",
+    "esbuild": "^0.28.2",
     "typescript": "^7.0.2"
   },
   "dependencies": {
