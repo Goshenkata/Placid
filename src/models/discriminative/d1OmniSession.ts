@@ -27,6 +27,8 @@ export class D1OmniSession implements ProbabilitySession {
     private readonly maxLength: number; // longest request the model accepts, in tokens
     private readonly temperature: number; // calibration: divides the scores before they become a probability
     private readonly tokenIds: Record<keyof typeof D1OmniSession.TOKENS, number>; // TOKENS as token ids
+    private readonly optionTokens: number[][]; // OPTIONS, tokenized once
+    private readonly fixedTokenCount: number; // tokens in every input besides the text and question
 
     constructor(model: PreTrainedModel, tokenizer: PreTrainedTokenizer, maxLength: number, temperature: number) {
         this.model = model;
@@ -43,11 +45,28 @@ export class D1OmniSession implements ProbabilitySession {
             decide: tokenizer.convert_tokens_to_ids(TOKENS.decide),
             marker: tokenizer.convert_tokens_to_ids(TOKENS.marker),
         };
+
+        this.optionTokens = D1OmniSession.OPTIONS.map((optionText) => this.tokenize(" " + optionText));
+        // <bos> <state> <q> <decide>, plus <opt> <mask> … </opt> around each option
+        this.fixedTokenCount = 4;
+        for (const tokens of this.optionTokens) {
+            this.fixedTokenCount += 3 + tokens.length;
+        }
     }
 
-    /** P(yes) for `question` about `text`, between 0 and 1. */
+    /** P(yes) for `question` about `text`, between 0 and 1. Throws if the question or text is too long. */
     async probability(text: string, question: string): Promise<number> {
-        const { ids, markers } = this.encode(text, question);
+        const questionTokens = this.tokenize(question);
+        const textTokens = this.tokenize(text);
+        const maxTextTokens = this.maxLength - this.fixedTokenCount - questionTokens.length;
+        if (questionTokens.length > D1OmniSession.QUESTION_MAX_TOKENS) {
+            throw new Error(`Question is ${questionTokens.length} tokens; d1 accepts at most ${D1OmniSession.QUESTION_MAX_TOKENS}.`);
+        }
+        if (textTokens.length > maxTextTokens) {
+            throw new Error(`Text is ${textTokens.length} tokens; d1 accepts at most ${maxTextTokens} with this question.`);
+        }
+
+        const { ids, markers } = this.encode(textTokens, questionTokens);
 
         const { logits } = await this.model({
             input_ids: int64Tensor(ids),
@@ -65,42 +84,24 @@ export class D1OmniSession implements ProbabilitySession {
         return 1 / (1 + Math.exp((noScore - yesScore) / this.temperature));
     }
 
-    /**
-     * Builds d1's input for one yes/no question (port of prompt.py `encode()`). `markers` are the <mask> positions.
-     * Throws if the question or text is too long, instead of cutting it short.
-     */
-    private encode(text: string, question: string): { ids: number[]; markers: number[] } {
-        const { state, question: questionStart, option, optionEnd, decide, marker } = this.tokenIds;
-
-        const questionTokens = this.tokenize(question);
-        if (questionTokens.length > D1OmniSession.QUESTION_MAX_TOKENS) {
-            throw new Error(`Question is ${questionTokens.length} tokens; d1 accepts at most ${D1OmniSession.QUESTION_MAX_TOKENS}.`);
-        }
-
-        // <q> question <opt> <mask> false: … </opt> <opt> <mask> true: … </opt> <decide>
-        const questionPart = [questionStart, ...questionTokens];
-        const markerOffsets: number[] = [];
-        for (const optionText of D1OmniSession.OPTIONS) {
-            questionPart.push(option);
-            markerOffsets.push(questionPart.length);
-            questionPart.push(marker, ...this.tokenize(" " + optionText), optionEnd);
-        }
-        questionPart.push(decide);
-
-        // Whatever the question part leaves of maxLength, minus <bos> and <state>, is room for the text.
-        const textTokens = this.tokenize(text);
-        const maxTextTokens = this.maxLength - questionPart.length - 2;
-        if (textTokens.length > maxTextTokens) {
-            throw new Error(`Text is ${textTokens.length} tokens; d1 accepts at most ${maxTextTokens} with this question.`);
-        }
+    /** Builds d1's input for one yes/no question (port of prompt.py `encode()`). `markers` are the <mask> positions. */
+    private encode(textTokens: number[], questionTokens: number[]): { ids: number[]; markers: number[] } {
+        const { state, question, option, optionEnd, decide, marker } = this.tokenIds;
 
         // <bos> <state> text
-        const textPart = [this.tokenizer.bos_token_id, state, ...textTokens];
+        const ids = [this.tokenizer.bos_token_id, state, ...textTokens];
 
-        return {
-            ids: [...textPart, ...questionPart],
-            markers: markerOffsets.map((offset) => textPart.length + offset),
-        };
+        // <q> question <opt> <mask> false: … </opt> <opt> <mask> true: … </opt> <decide>
+        ids.push(question, ...questionTokens);
+        const markers: number[] = [];
+        for (const tokens of this.optionTokens) {
+            ids.push(option);
+            markers.push(ids.length);
+            ids.push(marker, ...tokens, optionEnd);
+        }
+        ids.push(decide);
+
+        return { ids, markers };
     }
 
     /** Text -> token ids, with `<|name|>` escaped to `<¦name¦>` so page text can't fake a special token. */
