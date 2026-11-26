@@ -102,7 +102,7 @@ export class D1OmniModel implements Model<D1OmniSession> {
 
         const modelRepoConfig = await this.getModelRepoConfig();
         const tokenizer = await AutoTokenizer.from_pretrained(D1OmniModel.REPO);
-        const forward = (await this.runsOnGpu()) ? await this.loadFullModel(modelRepoConfig) : await this.loadSplitModel(modelRepoConfig);
+        const forward = await this.loadForward(modelRepoConfig);
 
         const d1Fields = modelRepoConfig as any; // d1-specific fields that PretrainedConfig doesn't type
         return new D1OmniSession(
@@ -112,6 +112,19 @@ export class D1OmniModel implements Model<D1OmniSession> {
             // d1 keeps one temperature per question type and option count; ours is yes/no with 2 options.
             d1Fields.temperatures?.["noul:2"] ?? d1Fields.temperatures?.["noul"] ?? 1,
         );
+    }
+
+    /** GPU if there is one; if loading there fails, the CPU instead. */
+    private async loadForward(config: PretrainedConfig): Promise<D1Forward> {
+        if (await this.runsOnGpu()) {
+            try {
+                return await this.loadFullModel(config);
+            } catch (error) {
+                console.warn("d1 failed to load on WebGPU, using the CPU:", error);
+                this.onGpu = false; // from now on we use the split files, checkState() included
+            }
+        }
+        return this.loadSplitModel(config);
     }
 
     private async loadFullModel(config: PretrainedConfig): Promise<D1Forward> {
