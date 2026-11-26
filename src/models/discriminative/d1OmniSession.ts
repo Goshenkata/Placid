@@ -84,11 +84,6 @@ export class D1OmniSession implements ProbabilitySession {
         return 1 / (1 + Math.exp((noScore - yesScore) / this.temperature));
     }
 
-    /** Frees the model's memory. probability() fails after this. */
-    async dispose(): Promise<void> {
-        await this.model.dispose();
-    }
-
     /** Builds d1's input for one yes/no question (port of prompt.py `encode()`). `markers` are the <mask> positions. */
     private encode(textTokens: number[], questionTokens: number[]): { ids: number[]; markers: number[] } {
         const { state, question, option, optionEnd, decide, marker } = this.tokenIds;

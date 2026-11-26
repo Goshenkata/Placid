@@ -63,16 +63,6 @@ export class D1OmniModel implements Model<D1OmniSession> {
         }
     }
 
-    /** Frees the model's GPU memory. Sessions from earlier load() calls stop working; the files stay cached. */
-    async unload(): Promise<void> {
-        const loading = this.sharedLoad;
-        if (!loading) return;
-        this.sharedLoad = null; // the next load() loads again
-        const session = await loading;
-        this._state = "downloaded";
-        await session.dispose();
-    }
-
     /** True when every file the model needs is already in the browser's download cache. */
     private async modelFilesInBrowserCache(): Promise<boolean> {
         const textOnly = { include_processor: false }; // skip d1's image/audio settings, which we never download (missing from transformers.js's types)

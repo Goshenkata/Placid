@@ -60,22 +60,3 @@ test("every waiting load() caller gets progress", async () => {
     assert.deepEqual(second, [50]);
     assert.equal(model.progressListeners.size, 0); // removed once load() returns
 });
-
-test("unload() frees the session, and the next load() loads again", async () => {
-    const model: any = new D1OmniModel();
-    let disposed = 0;
-    let loads = 0;
-    model.downloadAndLoad = async () => {
-        loads++;
-        return { ...fakeSession, dispose: async () => { disposed++; } };
-    };
-
-    await model.load();
-    await model.unload();
-    assert.equal(disposed, 1);
-    assert.equal(model.state, "downloaded");
-
-    await model.load();
-    assert.equal(loads, 2);
-    assert.equal(model.state, "ready");
-});

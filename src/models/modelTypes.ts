@@ -14,7 +14,6 @@ export type Model<Session> = {
     readonly state: ModelState;
     checkState(): Promise<ModelState>;                       // startup: replaces "unknown"
     load(onProgress?: ProgressCallback): Promise<Session>;   // downloads first if needed; concurrent calls share one load
-    unload(): Promise<void>;                                 // frees memory; sessions from load() stop working, files stay cached
 };
 
 /** A loaded model that gives P(yes) for a yes/no question about a text. One session answers any number of questions. */
