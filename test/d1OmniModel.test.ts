@@ -60,3 +60,25 @@ test("every waiting load() caller gets progress", async () => {
     assert.deepEqual(second, [50]);
     assert.equal(model.progressListeners.size, 0); // removed once load() returns
 });
+
+test("progress adds up the bytes of every file being loaded", () => {
+    const model: any = new D1OmniModel();
+    const percents: number[] = [];
+    model.progressListeners.add((percent: number) => percents.push(percent));
+    model.needsDownload = true;
+    const embedTokens = (info: object) => model.reportProgress("embed_tokens", info);
+    const decision = (info: object) => model.reportProgress("decision", info);
+
+    embedTokens({ status: "progress_total", loaded: 0, total: 100 });
+    decision({ status: "progress_total", loaded: 0, total: 300 });
+    embedTokens({ status: "progress_total", loaded: 100, total: 100 }); // first file done: 100 of 400 bytes
+    assert.equal(percents.at(-1), 25);
+    assert.equal(model.state, "downloading");
+
+    decision({ status: "progress_total", loaded: 0, total: 900 }); // decision's big part starts: total grows, percent would dip to 10
+    assert.equal(percents.at(-1), 25); // never reported lower
+
+    decision({ status: "progress_total", loaded: 900, total: 900 });
+    assert.equal(percents.at(-1), 100);
+    assert.equal(model.state, "loading"); // downloaded, now loading into memory
+});

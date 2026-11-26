@@ -1,5 +1,8 @@
-import { PreTrainedModel, PreTrainedTokenizer, Tensor } from "@huggingface/transformers";
+import { PreTrainedTokenizer, Tensor } from "@huggingface/transformers";
 import type { ProbabilitySession } from "../modelTypes";
+
+/** Runs d1 once: its named input tensors in, one score per option (`logits`) out. */
+export type D1Forward = (inputs: Record<string, Tensor>) => Promise<{ logits: Tensor }>;
 
 /** A loaded d1-omni-600M that answers yes/no questions about texts. Get one from D1OmniModel.load(). */
 export class D1OmniSession implements ProbabilitySession {
@@ -22,7 +25,7 @@ export class D1OmniSession implements ProbabilitySession {
     /** Longest question d1 was trained with, in tokens (prompt.py allows 96 including the <q> marker). */
     private static readonly QUESTION_MAX_TOKENS = 95;
 
-    private readonly model: PreTrainedModel;
+    private readonly forward: D1Forward;
     private readonly tokenizer: PreTrainedTokenizer;
     private readonly maxLength: number; // longest request the model accepts, in tokens
     private readonly temperature: number; // calibration: divides the scores before they become a probability
@@ -30,8 +33,8 @@ export class D1OmniSession implements ProbabilitySession {
     private readonly optionTokens: number[][]; // OPTIONS, tokenized once
     private readonly fixedTokenCount: number; // tokens in every input besides the text and question
 
-    constructor(model: PreTrainedModel, tokenizer: PreTrainedTokenizer, maxLength: number, temperature: number) {
-        this.model = model;
+    constructor(forward: D1Forward, tokenizer: PreTrainedTokenizer, maxLength: number, temperature: number) {
+        this.forward = forward;
         this.tokenizer = tokenizer;
         this.maxLength = maxLength;
         this.temperature = temperature;
@@ -68,7 +71,7 @@ export class D1OmniSession implements ProbabilitySession {
 
         const { ids, markers } = this.encode(textTokens, questionTokens);
 
-        const { logits } = await this.model({
+        const { logits } = await this.forward({
             input_ids: int64Tensor(ids),
             attention_mask: int64Tensor(ids.map(() => 1)), // 1 = look at this token (all of them)
             prefix_len: int64Tensor([0], [1]), // number of image/audio tokens before the text: none
