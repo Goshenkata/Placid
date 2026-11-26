@@ -82,3 +82,23 @@ test("progress adds up the bytes of every file being loaded", () => {
     assert.equal(percents.at(-1), 100);
     assert.equal(model.state, "loading"); // downloaded, now loading into memory
 });
+
+test("checkState says not-downloaded when the cache check fails (offline)", async () => {
+    const model: any = new D1OmniModel();
+    model.modelFilesInBrowserCache = async () => {
+        throw new Error("fetch failed");
+    };
+    assert.equal(await model.checkState(), "not-downloaded");
+});
+
+test("a failed load frees the files it already loaded", async () => {
+    const model: any = new D1OmniModel();
+    let disposed = 0;
+    model.downloadAndLoad = async () => {
+        model.loadedModels.push({ dispose: async () => disposed++ }); // one file loaded...
+        throw new Error("second file failed"); // ...then the other failed
+    };
+    await assert.rejects(model.load(), /second file failed/);
+    assert.equal(disposed, 1);
+    assert.deepEqual(model.loadedModels, []);
+});

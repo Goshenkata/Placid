@@ -22,6 +22,7 @@ export class D1OmniModel implements Model<D1OmniSession> {
     private sharedLoad: Promise<D1OmniSession> | null = null; // started by the first load(); later calls wait for it
     private progressListeners = new Set<ProgressCallback>(); // onProgress of every load() call still waiting
     private onGpu: boolean | null = null; // decided once by hasGpuAdapter(): which files we use
+    private loadedModels: PreTrainedModel[] = []; // model files in memory; unload() frees them
 
     // Progress of the current load, reset when it starts.
     private needsDownload = false; // are any files missing from the cache?
@@ -41,7 +42,11 @@ export class D1OmniModel implements Model<D1OmniSession> {
     /** Startup only: looks in the browser cache to replace "unknown" with "downloaded" or "not-downloaded". */
     async checkState(): Promise<ModelState> {
         if (this._state === "unknown") {
-            this._state = (await this.modelFilesInBrowserCache()) ? "downloaded" : "not-downloaded";
+            try {
+                this._state = (await this.modelFilesInBrowserCache()) ? "downloaded" : "not-downloaded";
+            } catch {
+                this._state = "not-downloaded"; // e.g. offline before d1's config.json was ever downloaded
+            }
         }
         return this._state;
     }
@@ -57,6 +62,7 @@ export class D1OmniModel implements Model<D1OmniSession> {
         } catch (error) {
             this.sharedLoad = null; // so the next load() starts over
             this._state = "error";
+            await this.unload(); // a failed load may have loaded some files already
             throw error;
         } finally {
             if (onProgress) this.progressListeners.delete(onProgress);
@@ -137,10 +143,15 @@ export class D1OmniModel implements Model<D1OmniSession> {
     private async loadSplitModel(config: PretrainedConfig): Promise<D1Forward> {
         const [embedTokensFile, decisionFile] = this.splitModelFiles();
         // Both at once, so progress counts both files' bytes from the start.
-        const [embedTokens, decision] = await Promise.all([
+        // allSettled: if one fails we still wait for the other, so unload() can free it.
+        const results = await Promise.allSettled([
             this.loadFile(config, embedTokensFile, "wasm"),
             this.loadFile(config, decisionFile, "wasm"),
         ]);
+        const [embedTokens, decision] = results.map((result) => {
+            if (result.status === "rejected") throw result.reason;
+            return result.value;
+        });
 
         return async (inputs) => {
             const { input_ids, ...decisionInputs } = inputs;
@@ -149,8 +160,8 @@ export class D1OmniModel implements Model<D1OmniSession> {
         };
     }
 
-    private loadFile(config: PretrainedConfig, file: { name: string; dtype: "fp16" | "q4" | "q8" }, device: "webgpu" | "wasm") {
-        return PreTrainedModel.from_pretrained(D1OmniModel.REPO, {
+    private async loadFile(config: PretrainedConfig, file: { name: string; dtype: "fp16" | "q4" | "q8" }, device: "webgpu" | "wasm") {
+        const model = await PreTrainedModel.from_pretrained(D1OmniModel.REPO, {
             config,
             model_file_name: file.name,
             dtype: file.dtype,
@@ -158,6 +169,15 @@ export class D1OmniModel implements Model<D1OmniSession> {
             use_external_data_format: true,
             progress_callback: (info: ProgressInfo) => this.reportProgress(file.name, info),
         });
+        this.loadedModels.push(model);
+        return model;
+    }
+
+    /** Frees every loaded model file. Private: only for a failed load, since a working session needs them. */
+    private async unload(): Promise<void> {
+        const models = this.loadedModels;
+        this.loadedModels = []; // cleared first: every waiting load() caller calls this
+        await Promise.all(models.map((model) => model.dispose()));
     }
 
     /** Adds up the bytes of every file being loaded and reports one 0–100 to every waiting load() caller. */
