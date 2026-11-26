@@ -13,6 +13,8 @@ import { D1OmniSession, type D1Forward } from "./d1OmniSession.ts";
 /** LiquidAI d1-omni-600M's files and lifecycle: is it downloaded, and loading it. Reference: https://huggingface.co/LiquidAI/d1-omni-600M */
 export class D1OmniModel implements Model<D1OmniSession> {
     private static readonly REPO = "onnx-community/d1-omni-600M-ONNX";
+    /** Longest request we send d1, in tokens. d1 reads up to 16384, but long texts run the GPU out of memory. */
+    private static readonly MAX_TOKENS = 2048;
 
     private _state: ModelState = "unknown";
     /** d1's config.json from its Hugging Face repo (not Placid's settings). */
@@ -108,7 +110,7 @@ export class D1OmniModel implements Model<D1OmniSession> {
         return new D1OmniSession(
             forward,
             tokenizer,
-            d1Fields.max_length ?? 16384,
+            D1OmniModel.MAX_TOKENS,
             // d1 keeps one temperature per question type and option count; ours is yes/no with 2 options.
             d1Fields.temperatures?.["noul:2"] ?? d1Fields.temperatures?.["noul"] ?? 1,
         );
