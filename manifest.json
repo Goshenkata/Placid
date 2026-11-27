@@ -3,6 +3,7 @@
   "name": "Placid",
   "version": "0.1.0",
   "description": "Context filtering with AI",
+  "minimum_chrome_version": "136",
   "background": {
     "service_worker": "dist/background.js",
     "scripts": ["dist/background.js"]
@@ -18,7 +19,7 @@
   "browser_specific_settings": {
     "gecko": {
       "id": "placid@tusofia",
-      "strict_min_version": "121.0"
+      "strict_min_version": "141.0"
     }
   }
 }

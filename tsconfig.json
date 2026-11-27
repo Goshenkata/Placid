@@ -3,12 +3,11 @@
     "target": "ES2022",
     "module": "ES2022",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "types": ["chrome"],
-    "rootDir": "src",
-    "outDir": "dist",
+    "types": ["chrome", "node"],
     "strict": true,
-    "noEmitOnError": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true
   },
-  "include": ["src"]
+  "include": ["src", "test"]
 }
